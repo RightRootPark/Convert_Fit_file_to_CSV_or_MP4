@@ -1,0 +1,17 @@
+# Data files
+*.fit
+*.csv
+*.mp4
+*.gpx
+*.tcx
+
+# Log files
+AnGLog/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local IDE
+.vscode/
+.idea/
