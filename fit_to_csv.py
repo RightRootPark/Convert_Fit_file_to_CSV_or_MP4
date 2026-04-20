@@ -56,6 +56,6 @@ def fit_to_csv(fit_filepath, csv_filepath):
         print(f"CSV 파일 쓰기 오류: {e}")
 
 if __name__ == "__main__":
-    fit_filename = r"C:\DTWorkSpace\AntiGravityProject\ZEEPLOG\Zepp20260408070313.fit"
-    csv_filename = r"C:\DTWorkSpace\AntiGravityProject\ZEEPLOG\Zepp20260408070313.csv"
+    fit_filename = r"C:\DTWorkSpace\AntiGravityProject\ZEEPLOG\Zepp20260419222058.fit"
+    csv_filename = r"C:\DTWorkSpace\AntiGravityProject\ZEEPLOG\Zepp20260419222058.csv"
     fit_to_csv(fit_filename, csv_filename)

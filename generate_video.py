@@ -3,6 +3,7 @@ import numpy as np
 import sys
 import os
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 try:
     from fitparse import FitFile
 except ImportError:
@@ -10,7 +11,7 @@ except ImportError:
 
 # 400x400 비율 설정
 WIDTH, HEIGHT = 400, 400
-FPS = 10  # 초당 프레임 수
+FPS = 60  # 재생 배속. 영상 속도는 현실 1초=1프레임 기준이므로, FPS 60은 60배속을 뜻합니다. 1배속(실시간)은 1로 변경하세요.
 
 class DataParser:
     @staticmethod
@@ -20,16 +21,21 @@ class DataParser:
             fitfile = FitFile(filepath)
             points = []
             for record in fitfile.get_messages('record'):
-                lat = record.get_value('position_lat')
-                lon = record.get_value('position_long')
-                timestamp = record.get_value('timestamp')
-                speed = record.get_value('speed')
-                if lat is not None and lon is not None:
-                    points.append({
-                        'coord': (lat * (180.0 / 2**31), lon * (180.0 / 2**31)),
-                        'timestamp': str(timestamp).split('+')[0] if timestamp else "N/A",
-                        'speed': float(speed) if speed is not None else 0.0
-                    })
+                try:
+                    lat = record.get_value('position_lat')
+                    lon = record.get_value('position_long')
+                    timestamp = record.get_value('timestamp')
+                    speed = record.get_value('speed')
+                    hr = record.get_value('heart_rate')
+                    if lat is not None and lon is not None and timestamp is not None:
+                        points.append({
+                            'coord': (lat * (180.0 / 2**31), lon * (180.0 / 2**31)),
+                            'timestamp': timestamp,
+                            'speed': float(speed) if speed is not None else 0.0,
+                            'hr': int(hr) if hr is not None else 0
+                        })
+                except Exception:
+                    continue
             return points
         except Exception as e:
             print(f"FIT 파싱 오류: {e}")
@@ -49,18 +55,30 @@ class DataParser:
                 lat = float(trkpt.get('lat'))
                 lon = float(trkpt.get('lon'))
                 time_node = trkpt.find('default:time', ns)
-                timestamp = time_node.text if time_node is not None else "N/A"
+                if time_node is None: continue
+                timestamp_str = time_node.text.replace('Z', '')
+                try:
+                    timestamp = datetime.strptime(timestamp_str[:19], "%Y-%m-%dT%H:%M:%S")
+                except:
+                    continue
                 
                 # 속도 정보 (보통 extensions 내에 위치)
                 speed = 0.0
                 speed_node = trkpt.find('.//ns3:speed', ns)
                 if speed_node is not None:
                     speed = float(speed_node.text)
+
+                # 심박수 정보
+                hr = 0
+                hr_node = trkpt.find('.//ns3:hr', ns)
+                if hr_node is not None:
+                    hr = int(hr_node.text)
                 
                 points.append({
                     'coord': (lat, lon),
-                    'timestamp': timestamp.replace('T', ' ').replace('Z', ''),
-                    'speed': speed
+                    'timestamp': timestamp,
+                    'speed': speed,
+                    'hr': hr
                 })
             return points
         except Exception as e:
@@ -83,17 +101,28 @@ class DataParser:
                 lat = float(pos.find('default:LatitudeDegrees', ns).text)
                 lon = float(pos.find('default:LongitudeDegrees', ns).text)
                 time_node = tp.find('default:Time', ns)
-                timestamp = time_node.text if time_node is not None else "N/A"
+                if time_node is None: continue
+                timestamp_str = time_node.text.replace('Z', '')
+                try:
+                    timestamp = datetime.strptime(timestamp_str[:19], "%Y-%m-%dT%H:%M:%S")
+                except:
+                    continue
                 
                 speed = 0.0
                 speed_node = tp.find('.//ns3:Speed', ns)
                 if speed_node is not None:
                     speed = float(speed_node.text)
+
+                hr = 0
+                hr_node = tp.find('.//default:HeartRateBpm/default:Value', ns)
+                if hr_node is not None:
+                    hr = int(hr_node.text)
                 
                 points.append({
                     'coord': (lat, lon),
-                    'timestamp': timestamp.replace('T', ' ').replace('Z', ''),
-                    'speed': speed
+                    'timestamp': timestamp,
+                    'speed': speed,
+                    'hr': hr
                 })
             return points
         except Exception as e:
@@ -118,21 +147,89 @@ def create_video(input_path):
         print("유효한 데이터를 찾을 수 없습니다.")
         return
 
-    # 속도 필터링 및 km/h 변환
+    # 타임스탬프 순으로 정렬 (혹시 모를 오류 방지)
+    raw_points.sort(key=lambda x: x['timestamp'])
+
+    # 속도 필터링 및 km/h 변환 (원본 데이터 기준)
     window_size = 5
-    points = []
     for i in range(len(raw_points)):
         start = max(0, i - window_size // 2)
         end = min(len(raw_points), i + window_size // 2 + 1)
         avg_speed = sum(p['speed'] for p in raw_points[start:end]) / (end - start)
+        raw_points[i]['speed_kmh'] = round(avg_speed * 3.6, 1)
+
+    # 1초 간격으로 프레임 보간 생성 (실제 시간 흐름 반영)
+    start_time = raw_points[0]['timestamp']
+    end_time = raw_points[-1]['timestamp']
+    total_duration = int((end_time - start_time).total_seconds())
+
+    # 데이터 유지(Hold) 및 타임아웃 관리용 변수
+    current_hr = 0
+    current_speed_kmh = 0.0
+    hr_gap_timer = 0
+    speed_gap_timer = 0
+    HR_TIMEOUT = 20    # 심박수는 20초까지 유지
+    SPEED_TIMEOUT = 10 # 속도는 10초까지 유지
+
+    points = []
+    curr_idx = 0
+    for elapsed in range(total_duration + 1):
+        target_time = start_time + timedelta(seconds=elapsed)
         
-        p = raw_points[i].copy()
-        p['speed_kmh'] = round(avg_speed * 3.6, 1)
+        # 이번 초에 새로운 유효 데이터(0보다 큰 값)가 들어왔는지 체크
+        found_fresh_hr = False
+        found_fresh_speed = False
+        
+        # 현재 target_time에 해당하는 원본 데이터들을 처리
+        while curr_idx < len(raw_points) and raw_points[curr_idx]['timestamp'] <= target_time:
+            p_raw = raw_points[curr_idx]
+            
+            # 유효한 심박수가 들어왔다면 업데이트 및 타이머 리셋
+            if p_raw.get('hr', 0) > 0:
+                current_hr = p_raw['hr']
+                hr_gap_timer = 0
+                found_fresh_hr = True
+            
+            # 유효한 속도가 들어왔다면 업데이트 및 타이머 리셋
+            if p_raw.get('speed_kmh', 0) > 0:
+                current_speed_kmh = p_raw['speed_kmh']
+                speed_gap_timer = 0
+                found_fresh_speed = True
+                
+            curr_idx += 1
+            
+        # 이번 1초(elapsed) 동안 새로운 비-제로 데이터를 못 만났다면 타이머 증가
+        if not found_fresh_hr:
+            hr_gap_timer += 1
+        if not found_fresh_speed:
+            speed_gap_timer += 1
+
+        # 타임아웃 체크: 정해진 시간을 넘으면 0으로 리셋
+        if hr_gap_timer > HR_TIMEOUT:
+            current_hr = 0
+        if speed_gap_timer > SPEED_TIMEOUT:
+            current_speed_kmh = 0.0
+
+        p = raw_points[max(0, curr_idx - 1)].copy()
+        p['hr'] = current_hr
+        p['speed_kmh'] = current_speed_kmh
+        
+        # 경과 시간을 HH:MM:SS 포맷으로 변환하여 추가
+        hours, rem = divmod(elapsed, 3600)
+        minutes, seconds = divmod(rem, 60)
+        p['elapsed_str'] = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+        
         points.append(p)
 
-    # 출력파일명 설정
-    output_file = os.path.join(os.path.dirname(input_path), 
-                               os.path.splitext(os.path.basename(input_path))[0] + "route.mp4")
+    # 출력파일명 설정 및 중복 방지 로직
+    base_name = os.path.join(os.path.dirname(input_path), 
+                             os.path.splitext(os.path.basename(input_path))[0] + "route")
+    output_file = f"{base_name}.mp4"
+    
+    counter = 1
+    while os.path.exists(output_file):
+        output_file = f"{base_name}({counter}).mp4"
+        counter += 1
 
     # 좌표 최소/최대값 및 여백
     lats, lons = zip(*[p['coord'] for p in points])
@@ -180,9 +277,9 @@ def create_video(input_path):
         curr_p = to_pixel(*points[i]['coord'])
         cv2.circle(frame, curr_p, 5, (0, 0, 255), -1)
 
-        # 상단 정보 바 및 텍스트
+        # 상단 정보 바 및 텍스트 (경과시간 / 속도 / 심박수)
         cv2.rectangle(frame, (0, 0), (WIDTH, 30), (30, 30, 30), -1)
-        info_text = f"{points[i]['timestamp']} | {points[i]['speed_kmh']} km/h"
+        info_text = f"{points[i]['elapsed_str']} | {points[i]['speed_kmh']} km/h | {points[i]['hr']} bpm"
         cv2.putText(frame, info_text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
         out.write(frame)
