@@ -1,6 +1,7 @@
 # ZEEPLOG - FIT Data Processing & Visualization
 
 FIT(Binary) 운동 기록 파일을 분석하여 CSV 파일로 변환하고, 이동 경로를 영상으로 시각화하는 도구 모음임.
+시연 영상 : https://youtu.be/ntO73FkwCGU
 
 ## 1. 주요 기능
 - **CSV 변환**: 바이너리 형태의 `.fit` 파일을 읽어 시간, 위치(Do), 속도, 심박수 등을 포함한 `.csv` 파일로 변환함.
