@@ -16,3 +16,5 @@ __pycache__/
 .vscode/
 .idea/
 publish/
+ZeeplogWpf/bin/
+ZeeplogWpf/obj/
