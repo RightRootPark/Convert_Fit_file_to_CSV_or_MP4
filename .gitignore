@@ -15,3 +15,4 @@ __pycache__/
 # Local IDE
 .vscode/
 .idea/
+publish/

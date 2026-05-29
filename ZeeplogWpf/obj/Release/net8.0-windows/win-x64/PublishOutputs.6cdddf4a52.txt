@@ -1,0 +1,2 @@
+C:\DTshare\ClauceProject\ZEEPLOG\publish\ZeeplogWpf.pdb
+C:\DTshare\ClauceProject\ZEEPLOG\publish\ZeeplogWpf.exe
