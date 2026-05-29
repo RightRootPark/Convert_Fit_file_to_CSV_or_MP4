@@ -4,19 +4,22 @@ using ZeeplogWpf.Models;
 namespace ZeeplogWpf.Parsers;
 
 /// <summary>
-/// Minimal FIT binary parser.
-/// Spec: FIT Protocol 21.x — record message (global #20) fields.
+/// Minimal FIT binary parser — Spec: FIT Protocol 21.x
 ///
-/// Key fix: compressed timestamp records (header bit7=1) do NOT contain field 253.
-/// The timestamp is reconstructed from the 5-bit time offset in the record header
-/// and the last full timestamp seen in a normal record (field 253).
-/// Most Zepp/Amazfit FIT files use this scheme for the majority of records.
+/// Bug history:
+///  1. Compressed timestamp records (header bit7=1) do not contain field 253.
+///     Fix: reconstruct timestamp from 5-bit offset + lastTimestampRaw.
+///
+///  2. Zepp/Huami FIT files embed developer-data fields (fit.huami.com).
+///     Definition messages with has_dev=1 are followed by dev-field definitions
+///     that describe extra bytes appended to every subsequent DATA message of
+///     that local type.  If those dev bytes are not skipped, the stream position
+///     drifts and every subsequent message is misread.
+///     Fix: store DevDataTotalSize per local-message-type, skip in ProcessData.
 /// </summary>
 public static class FitParser
 {
-    // FIT epoch: 1989-12-31 00:00:00 UTC
     private static readonly DateTime FitEpoch = new(1989, 12, 31, 0, 0, 0, DateTimeKind.Utc);
-
     private const int MsgRecord = 20;
 
     private static readonly Dictionary<byte, (string Name, double Scale, bool IsSigned)> FieldDefs = new()
@@ -75,7 +78,6 @@ public static class FitParser
     {
         public byte FieldNumber;
         public byte Size;
-        public byte BaseType;
     }
 
     private sealed class MsgDefEntry
@@ -83,31 +85,38 @@ public static class FitParser
         public int GlobalMsgNumber;
         public bool BigEndian;
         public List<FieldDefEntry> Fields = [];
+        /// <summary>
+        /// Total byte count of developer-data fields appended to each DATA
+        /// message of this local type.  Must be skipped after regular fields.
+        /// </summary>
+        public int DevDataTotalSize;
     }
 
     // ── Core parser ─────────────────────────────────────────────────────────
 
-    private static void ParseFile(string filePath, List<DataPoint>? videoOut, List<Dictionary<string, object?>>? csvOut)
+    private static void ParseFile(string filePath,
+        List<DataPoint>? videoOut, List<Dictionary<string, object?>>? csvOut)
     {
         using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
         using var reader = new BinaryReader(stream);
 
+        // ── File header ──────────────────────────────────────────────────────
         byte headerSize = reader.ReadByte();
         if (headerSize < 12) throw new InvalidDataException("FIT 파일 헤더가 올바르지 않습니다.");
-        reader.ReadByte();   // protocol version
-        reader.ReadUInt16(); // profile version
+        reader.ReadByte();    // protocol version
+        reader.ReadUInt16();  // profile version
         uint dataSize = reader.ReadUInt32();
         byte[] magic = reader.ReadBytes(4);
         if (magic[0] != '.' || magic[1] != 'F' || magic[2] != 'I' || magic[3] != 'T')
             throw new InvalidDataException("FIT 파일이 아닙니다.");
         if (headerSize > 12)
-            reader.ReadBytes(headerSize - 12);
+            reader.ReadBytes(headerSize - 12); // skip header CRC etc.
 
         long dataEnd = stream.Position + dataSize;
-        var defs = new Dictionary<int, MsgDefEntry>();
+        var defs = new Dictionary<int, MsgDefEntry>(); // local type → definition
 
-        // Tracks the last full FIT timestamp (uint32, seconds since FIT epoch).
-        // Required to reconstruct timestamps from compressed timestamp records.
+        // Last full FIT timestamp seen in a normal field 253.
+        // Used to reconstruct timestamps for compressed-timestamp records.
         uint lastTimestampRaw = 0;
 
         while (stream.Position < dataEnd && stream.Position < stream.Length - 1)
@@ -117,19 +126,16 @@ public static class FitParser
 
             if (compressed)
             {
-                // Compressed timestamp header:
-                //   bit 7   = 1 (compressed)
-                //   bits 6-5 = local message type (0-3)
-                //   bits 4-0 = 5-bit time offset (seconds, wraps every 32 s)
-                int lt = (hdr >> 5) & 0x03;
+                // ── Compressed timestamp record ──────────────────────────────
+                // header: [1 | lt(2) | time_offset(5)]
+                // The 5-bit time_offset is the lower 5 bits of the current
+                // timestamp in seconds; reconstruct by OR-ing with upper bits.
+                int  lt         = (hdr >> 5) & 0x03;
                 uint timeOffset = (uint)(hdr & 0x1F);
 
-                // Reconstruct full timestamp: keep upper bits, replace lower 5 bits.
-                // If the result would be earlier than the last known timestamp, a
-                // 5-bit rollover (32 s) has occurred — add 32.
                 uint actualTs = (lastTimestampRaw & 0xFFFFFFE0u) | timeOffset;
                 if (actualTs < lastTimestampRaw)
-                    actualTs += 0x20u;
+                    actualTs += 0x20u; // 5-bit rollover (32 s)
                 lastTimestampRaw = actualTs;
 
                 if (defs.TryGetValue(lt, out var d))
@@ -138,12 +144,13 @@ public static class FitParser
                 continue;
             }
 
-            bool isDef = (hdr & 0x40) != 0;
+            bool isDef  = (hdr & 0x40) != 0;
             bool hasDev = (hdr & 0x20) != 0;
-            int local = hdr & 0x0F;
+            int  local  = hdr & 0x0F;
 
             if (isDef)
             {
+                // ── Definition message ────────────────────────────────────────
                 reader.ReadByte(); // reserved
                 byte arch = reader.ReadByte();
                 bool bigEndian = arch == 1;
@@ -156,48 +163,55 @@ public static class FitParser
                 var def = new MsgDefEntry { GlobalMsgNumber = globalNum, BigEndian = bigEndian };
 
                 for (int i = 0; i < numFields; i++)
-                    def.Fields.Add(new FieldDefEntry
-                    {
-                        FieldNumber = reader.ReadByte(),
-                        Size        = reader.ReadByte(),
-                        BaseType    = reader.ReadByte()
-                    });
+                {
+                    byte fn = reader.ReadByte();
+                    byte fs = reader.ReadByte();
+                    reader.ReadByte(); // base type (not needed for parsing)
+                    def.Fields.Add(new FieldDefEntry { FieldNumber = fn, Size = fs });
+                }
 
                 if (hasDev)
                 {
+                    // Developer-field definitions: each is 3 bytes
+                    // (field_num, size, developer_data_index).
+                    // We don't interpret them but MUST accumulate their sizes so
+                    // the matching DATA messages can be read correctly.
                     byte nd = reader.ReadByte();
-                    for (int i = 0; i < nd; i++) reader.ReadBytes(3);
+                    for (int i = 0; i < nd; i++)
+                    {
+                        reader.ReadByte();                    // field number
+                        def.DevDataTotalSize += reader.ReadByte(); // size — accumulate!
+                        reader.ReadByte();                    // developer data index
+                    }
                 }
 
                 defs[local] = def;
             }
             else
             {
+                // ── Data message ─────────────────────────────────────────────
                 if (!defs.TryGetValue(local, out var def)) break;
                 ProcessData(reader, def, videoOut, csvOut, null, ref lastTimestampRaw);
             }
         }
     }
 
-    /// <param name="compressedTs">
-    /// Pre-computed timestamp for compressed-timestamp records (field 253 absent).
-    /// Null for normal data records (timestamp comes from field 253 in data).
-    /// </param>
     private static void ProcessData(
         BinaryReader reader,
-        MsgDefEntry def,
+        MsgDefEntry  def,
         List<DataPoint>? videoOut,
         List<Dictionary<string, object?>>? csvOut,
-        DateTime? compressedTs,
-        ref uint lastTimestampRaw)
+        DateTime? compressedTs,       // pre-computed ts for compressed-header records
+        ref uint  lastTimestampRaw)
     {
         bool isRecord = def.GlobalMsgNumber == MsgRecord;
 
         double? lat = null, lon = null, speedMs = null, enhancedSpeedMs = null;
-        int? hr = null;
+        int?    hr  = null;
         DateTime? ts = null;
         Dictionary<string, object?>? csvRow = (csvOut != null && isRecord) ? [] : null;
 
+        // ── Regular fields ───────────────────────────────────────────────────
         foreach (var f in def.Fields)
         {
             byte[] raw = reader.ReadBytes(f.Size);
@@ -224,7 +238,8 @@ public static class FitParser
                 continue;
             }
 
-            bool isSigned = FieldDefs.TryGetValue(f.FieldNumber, out var fd) && fd.IsSigned;
+            bool knownField = FieldDefs.TryGetValue(f.FieldNumber, out var fd);
+            bool isSigned   = knownField && fd.IsSigned;
             long sval = isSigned ? f.Size switch
             {
                 1 => (sbyte)raw[0],
@@ -233,7 +248,6 @@ public static class FitParser
                 _ => uval
             } : uval;
 
-            bool knownField = fd.Name != null;
             double value = knownField ? sval * fd.Scale : uval;
             if (FieldOffsets.TryGetValue(f.FieldNumber, out double off))
                 value += off;
@@ -241,15 +255,14 @@ public static class FitParser
             switch (f.FieldNumber)
             {
                 case 253:
-                    // Normal (non-compressed) timestamp — update tracker for future compressed records
                     lastTimestampRaw = (uint)uval;
                     ts = FitEpoch.AddSeconds(uval);
                     csvRow?.TryAdd("timestamp", ts.Value.ToString("yyyy-MM-ddTHH:mm:ss"));
                     continue;
                 case 0:  lat = value; break;
                 case 1:  lon = value; break;
-                case 3:  hr = (int)uval; break;
-                case 6:  speedMs = value; break;
+                case 3:  hr  = (int)uval; break;
+                case 6:  speedMs         = value; break;
                 case 73: enhancedSpeedMs = value; break;
             }
 
@@ -257,7 +270,14 @@ public static class FitParser
                 csvRow[FieldName(f.FieldNumber)] = Math.Round(value, 6);
         }
 
-        // For compressed timestamp records, field 253 is absent — use pre-computed value
+        // ── Developer-data fields (skip bytes) ───────────────────────────────
+        // DATA messages whose definition had has_dev=1 append extra bytes after
+        // the regular fields.  They must be consumed to keep stream in sync.
+        if (def.DevDataTotalSize > 0)
+            reader.ReadBytes(def.DevDataTotalSize);
+
+        // ── Emit results ─────────────────────────────────────────────────────
+        // For compressed-timestamp records, field 253 is absent; fall back.
         ts ??= compressedTs;
 
         if (videoOut != null && isRecord && lat.HasValue && lon.HasValue && ts.HasValue)
@@ -272,7 +292,6 @@ public static class FitParser
 
         if (csvRow != null && csvRow.Count > 0)
         {
-            // For compressed timestamp rows that have no "timestamp" key yet, add it
             if (!csvRow.ContainsKey("timestamp") && compressedTs.HasValue)
                 csvRow["timestamp"] = compressedTs.Value.ToString("yyyy-MM-ddTHH:mm:ss");
             csvOut!.Add(csvRow);
